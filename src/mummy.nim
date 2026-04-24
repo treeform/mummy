@@ -88,7 +88,7 @@ type
     websocketHandler: WebSocketHandler
     logHandler: LogHandler
     maxHeadersLen, maxBodyLen, maxMessageLen: int
-    httpNoDelay, wsNoDelay: bool
+    tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
     serving: Atomic[bool]
@@ -1201,7 +1201,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               max(clientDataEntry.requestCounter - 1, 0)
 
             if encodedResponse.isWebSocketUpgrade:
-              if server.wsNoDelay:
+              if server.tcpNoDelay:
                 server.setNoDelay(encodedResponse.clientSocket)
               clientDataEntry.upgradedToWebSocket = true
               let websocket = WebSocket(
@@ -1305,7 +1305,7 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             # Not needed on linux where we can use SOCK_NONBLOCK
             clientSocket.setBlocking(false)
 
-          if server.httpNoDelay:
+          if server.tcpNoDelay:
             server.setNoDelay(clientSocket)
 
           server.clientSockets.incl(clientSocket)
@@ -1479,8 +1479,7 @@ proc newServer*(
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
   maxMessageLen = 64 * 1024, # 64 KB
-  httpNoDelay = false,
-  wsNoDelay = false
+  tcpNoDelay = true
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1503,8 +1502,7 @@ proc newServer*(
   result.maxHeadersLen = maxHeadersLen
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
-  result.httpNoDelay = httpNoDelay
-  result.wsNoDelay = wsNoDelay
+  result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
   result.workerThreads.setLen(workerThreads)
