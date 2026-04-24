@@ -249,15 +249,10 @@ proc trigger(
 
 proc setNoDelay(
   server: Server,
-  socket: SocketHandle,
-  enabled: bool
+  socket: SocketHandle
 ) {.raises: [].} =
   try:
-    socket.setSockOptInt(
-      Protocol.IPPROTO_TCP.int,
-      TCP_NODELAY.int,
-      if enabled: 1 else: 0
-    )
+    socket.setSockOptInt(Protocol.IPPROTO_TCP.int, TCP_NODELAY.int, 1)
   except Exception as e:
     server.log(
       ErrorLevel,
@@ -1206,10 +1201,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               max(clientDataEntry.requestCounter - 1, 0)
 
             if encodedResponse.isWebSocketUpgrade:
-              server.setNoDelay(
-                encodedResponse.clientSocket,
-                server.wsNoDelay
-              )
+              if server.wsNoDelay:
+                server.setNoDelay(encodedResponse.clientSocket)
               clientDataEntry.upgradedToWebSocket = true
               let websocket = WebSocket(
                 server: server,
@@ -1312,7 +1305,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             # Not needed on linux where we can use SOCK_NONBLOCK
             clientSocket.setBlocking(false)
 
-          server.setNoDelay(clientSocket, server.httpNoDelay)
+          if server.httpNoDelay:
+            server.setNoDelay(clientSocket)
 
           server.clientSockets.incl(clientSocket)
 
