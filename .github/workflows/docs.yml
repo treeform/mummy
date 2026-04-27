@@ -11,16 +11,17 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: jiro4989/setup-nim-action@v1
-        with:
-          nim-version: ${{ env.nim-version }}
-      - run: nimble install -Y
-      - run: nimble doc --index:on --git.url:https://github.com/${{ github.repository }} --git.commit:master  --out:${{ env.deploy-dir }}/ src/mummy/routers.nim
-      - run: nimble doc --index:on --project --git.url:https://github.com/${{ github.repository }} --git.commit:master  --out:${{ env.deploy-dir }} ${{ env.nim-src }}
-      - run: nim buildIndex -o:${{ env.deploy-dir }}/index.html ${{ env.deploy-dir }}
-      - name: Deploy documents
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ${{ env.deploy-dir }}
+    - uses: actions/checkout@v4
+    - uses: jiro4989/setup-nim-action@v2
+      with:
+        nim-version: ${{ matrix.nim-version }}
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+    - run: nimble install -Y
+    - run: nimble doc --index:on --git.url:https://github.com/${{ github.repository }} --git.commit:master  --out:${{ env.deploy-dir }}/ src/mummy/routers.nim
+    - run: nimble doc --index:on --project --git.url:https://github.com/${{ github.repository }} --git.commit:master  --out:${{ env.deploy-dir }} ${{ env.nim-src }}
+    - run: nim buildIndex -o:${{ env.deploy-dir }}/index.html ${{ env.deploy-dir }}
+    - name: Deploy documents
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ${{ env.deploy-dir }}
