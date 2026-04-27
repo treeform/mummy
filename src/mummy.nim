@@ -23,6 +23,11 @@ when defined(linux):
   let SOCK_NONBLOCK
     {.importc: "SOCK_NONBLOCK", header: "<sys/socket.h>".}: cint
 
+when defined(windows):
+  from std/winlean import TCP_NODELAY
+elif defined(posix):
+  from std/posix import TCP_NODELAY
+
 import std/locks
 
 export Port, common, httpheaders, queryparams
@@ -83,6 +88,7 @@ type
     websocketHandler: WebSocketHandler
     logHandler: LogHandler
     maxHeadersLen, maxBodyLen, maxMessageLen: int
+    tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
     serving: Atomic[bool]
@@ -239,6 +245,18 @@ proc trigger(
     server.log(
       ErrorLevel,
       "Error triggering event ", $err, " ", osErrorMsg(err)
+    )
+
+proc setNoDelay(
+  server: Server,
+  socket: SocketHandle
+) {.raises: [].} =
+  try:
+    socket.setSockOptInt(Protocol.IPPROTO_TCP.int, TCP_NODELAY.int, 1)
+  except Exception as e:
+    server.log(
+      ErrorLevel,
+      "Error setting TCP_NODELAY: ", e.msg
     )
 
 proc send*(
@@ -1183,6 +1201,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               max(clientDataEntry.requestCounter - 1, 0)
 
             if encodedResponse.isWebSocketUpgrade:
+              if server.tcpNoDelay:
+                server.setNoDelay(encodedResponse.clientSocket)
               clientDataEntry.upgradedToWebSocket = true
               let websocket = WebSocket(
                 server: server,
@@ -1284,6 +1304,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           when not defined(linux):
             # Not needed on linux where we can use SOCK_NONBLOCK
             clientSocket.setBlocking(false)
+
+          if server.tcpNoDelay:
+            server.setNoDelay(clientSocket)
 
           server.clientSockets.incl(clientSocket)
 
@@ -1455,7 +1478,8 @@ proc newServer*(
   workerThreads = max(countProcessors() * 10, 1),
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
-  maxMessageLen = 64 * 1024 # 64 KB
+  maxMessageLen = 64 * 1024, # 64 KB
+  tcpNoDelay = true
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1478,6 +1502,7 @@ proc newServer*(
   result.maxHeadersLen = maxHeadersLen
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
+  result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
   result.workerThreads.setLen(workerThreads)
