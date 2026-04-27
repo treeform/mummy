@@ -1,3 +1,5 @@
+# Disabled on 4/27/26 due to https://github.com/guzba/mummy/actions/runs/25017060576/job/73268049322
+
 name: docs
 on:
   push:
