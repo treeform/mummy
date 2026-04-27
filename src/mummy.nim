@@ -11,8 +11,6 @@ import mummy/common, mummy/internal, std/atomics, std/base64,
     std/tables, std/times, webby/httpheaders, webby/queryparams, webby/urls,
     zippy, std/options
 
-noise for github
-
 from std/strutils import find, cmpIgnoreCase, toLowerAscii
 
 when defined(linux):
