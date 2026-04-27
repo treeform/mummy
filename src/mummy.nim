@@ -1201,8 +1201,6 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               max(clientDataEntry.requestCounter - 1, 0)
 
             if encodedResponse.isWebSocketUpgrade:
-              if server.tcpNoDelay:
-                server.setNoDelay(encodedResponse.clientSocket)
               clientDataEntry.upgradedToWebSocket = true
               let websocket = WebSocket(
                 server: server,
