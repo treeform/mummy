@@ -88,7 +88,7 @@ type
     websocketHandler: WebSocketHandler
     logHandler: LogHandler
     maxHeadersLen, maxBodyLen, maxMessageLen: int
-    requestTimeoutMs: int
+    requestTimeoutMs, writeTimeoutMs: int
     tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
@@ -136,7 +136,7 @@ type
       upgradedToWebSocket, closeFrameSent: bool
       sendsWaitingForUpgrade: seq[OutgoingBuffer]
       requestCounter: int # Incoming request incs, outgoing response decs
-      readAt: int64
+      readAt, writeAt: int64
 
   IncomingRequestState = object
     headersParsed: bool
@@ -166,6 +166,10 @@ type
   WebSocketUpdate = object
     event: WebSocketEvent
     message: Message
+
+proc readMilliseconds(): int64 {.raises: [].} =
+  ## Reads a monotonic clock for socket inactivity deadlines.
+  getMonoTime().ticks div 1_000_000
 
 proc `$`*(request: Request): string {.gcsafe.} =
   result = request.httpMethod & " " & request.uri & " "
@@ -588,6 +592,8 @@ proc sendCloseFrame(
   outgoingBuffer.buffer1 = encodeFrameHeader(0x8, 0)
   outgoingBuffer.isCloseFrame = true
   outgoingBuffer.closeConnection = closeConnection
+  if server.writeTimeoutMs > 0 and dataEntry.outgoingBuffers.len == 0:
+    dataEntry.writeAt = readMilliseconds()
   dataEntry.outgoingBuffers.addLast(outgoingBuffer)
   dataEntry.closeFrameQueuedAt = epochTime()
   server.selector.updateHandle2(clientSocket, {Read, Write})
@@ -1151,10 +1157,6 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     # The process is likely going to be exiting anyway
     discard
 
-proc readMilliseconds(): int64 {.raises: [].} =
-  ## Reads a monotonic clock for incoming HTTP inactivity deadlines.
-  getMonoTime().ticks div 1_000_000
-
 proc awaitingRequest(dataEntry: DataEntry): bool {.raises: [].} =
   ## Leaves handlers, outgoing responses, and WebSockets outside read deadlines.
   not dataEntry.upgradedToWebSocket and dataEntry.requestCounter == 0 and
@@ -1175,13 +1177,18 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     encodedFrames.setLen(0)
 
     var wait = -1
-    if server.requestTimeoutMs > 0:
+    if server.requestTimeoutMs > 0 or server.writeTimeoutMs > 0:
       let now = readMilliseconds()
       for clientSocket in server.clientSockets:
         let dataEntry = server.selector.getData(clientSocket)
-        if dataEntry.awaitingRequest():
+        if server.requestTimeoutMs > 0 and dataEntry.awaitingRequest():
           let remaining = max(0'i64,
             dataEntry.readAt + server.requestTimeoutMs.int64 - now).int
+          if wait < 0 or remaining < wait:
+            wait = remaining
+        if server.writeTimeoutMs > 0 and dataEntry.outgoingBuffers.len > 0:
+          let remaining = max(0'i64,
+            dataEntry.writeAt + server.writeTimeoutMs.int64 - now).int
           if wait < 0 or remaining < wait:
             wait = remaining
     let readyCount = server.selector.selectInto(wait, readyKeys)
@@ -1214,6 +1221,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           let clientDataEntry =
             server.selector.getData(encodedResponse.clientSocket)
           if encodedResponse.clientId == clientDataEntry.clientId:
+            if server.writeTimeoutMs > 0 and
+              clientDataEntry.outgoingBuffers.len == 0:
+                clientDataEntry.writeAt = readMilliseconds()
             clientDataEntry.outgoingBuffers.addLast(encodedResponse)
             server.selector.updateHandle2(
               encodedResponse.clientSocket,
@@ -1269,6 +1279,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               if clientDataEntry.closeFrameQueuedAt > 0:
                 server.log(DebugLevel, "Dropped message after WebSocket close")
               else:
+                if server.writeTimeoutMs > 0 and
+                  clientDataEntry.outgoingBuffers.len == 0:
+                    clientDataEntry.writeAt = readMilliseconds()
                 clientDataEntry.outgoingBuffers.addLast(encodedFrame)
                 if encodedFrame.isCloseFrame:
                   clientDataEntry.closeFrameQueuedAt = epochTime()
@@ -1384,6 +1397,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
                   when defined(MSG_NOSIGNAL): MSG_NOSIGNAL else: 0
                 )
           if bytesSent > 0:
+            if server.writeTimeoutMs > 0:
+              dataEntry.writeAt = readMilliseconds()
             outgoingBuffer.bytesSent += bytesSent
             sentTo.add(readyKey.fd.SocketHandle)
           else:
@@ -1410,12 +1425,15 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
       elif server.requestTimeoutMs > 0 and dataEntry.awaitingRequest():
         dataEntry.readAt = readMilliseconds()
 
-    if server.requestTimeoutMs > 0:
+    if server.requestTimeoutMs > 0 or server.writeTimeoutMs > 0:
       let now = readMilliseconds()
       for clientSocket in server.clientSockets:
         let dataEntry = server.selector.getData(clientSocket)
-        if dataEntry.awaitingRequest() and
+        if server.requestTimeoutMs > 0 and dataEntry.awaitingRequest() and
           now - dataEntry.readAt >= server.requestTimeoutMs.int64:
+            needClosing.incl(clientSocket)
+        if server.writeTimeoutMs > 0 and dataEntry.outgoingBuffers.len > 0 and
+          now - dataEntry.writeAt >= server.writeTimeoutMs.int64:
             needClosing.incl(clientSocket)
 
     for clientSocket in needClosing:
@@ -1452,13 +1470,12 @@ proc close*(server: Server) {.raises: [], gcsafe.} =
 proc serve*(
   server: Server,
   port: Port,
-  address = "localhost"
+  address = "localhost",
+  onReady: proc() {.gcsafe, raises: [].} = nil
 ) {.raises: [MummyError].} =
-  ## The server will serve on the address and port. The default address is
-  ## localhost. Use "0.0.0.0" to make the server externally accessible (with
-  ## caution).
-  ## This call does not return unless server.close() is called from another
-  ## thread.
+  ## Serves on the address and port until close() is requested.
+  ## The default address is localhost. Use "0.0.0.0" to listen externally.
+  ## If supplied, onReady runs once on this thread after listener setup.
 
   if server.socket.int != 0:
     raise newException(MummyError, "Server already has a socket")
@@ -1501,6 +1518,8 @@ proc serve*(
   server.serving.store(true, moRelaxed)
 
   try:
+    if onReady != nil:
+      onReady()
     server.loopForever()
   except Exception as e:
     server.log(ErrorLevel, e.msg & "\n" & e.getStackTrace())
@@ -1516,7 +1535,8 @@ proc newServer*(
   maxBodyLen = 1024 * 1024, # 1 MB
   maxMessageLen = 64 * 1024, # 64 KB
   tcpNoDelay = true,
-  requestTimeoutMs = 0
+  requestTimeoutMs = 0,
+  writeTimeoutMs = 0
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1530,6 +1550,9 @@ proc newServer*(
   if requestTimeoutMs < 0 or requestTimeoutMs > int32.high.int:
     raise newException(MummyError,
       "The request timeout must be between 0 and 2147483647 milliseconds")
+  if writeTimeoutMs < 0 or writeTimeoutMs > int32.high.int:
+    raise newException(MummyError,
+      "The write timeout must be between 0 and 2147483647 milliseconds")
 
   var workerThreads = workerThreads
   when defined(mummyNoWorkers): # For testing, fuzzing etc
@@ -1543,6 +1566,7 @@ proc newServer*(
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
   result.requestTimeoutMs = requestTimeoutMs
+  result.writeTimeoutMs = writeTimeoutMs
   result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
