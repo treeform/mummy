@@ -9,7 +9,7 @@ import mummy/common, mummy/internal, std/atomics, std/base64,
     std/cpuinfo, std/deques, std/hashes, std/nativesockets, std/os,
     std/parseutils, std/random, std/selectors, std/sets, crunchy,
     std/tables, std/times, webby/httpheaders, webby/queryparams, webby/urls,
-    zippy, std/options
+    zippy, std/options, std/monotimes
 
 from std/strutils import find, cmpIgnoreCase, toLowerAscii
 
@@ -88,6 +88,7 @@ type
     websocketHandler: WebSocketHandler
     logHandler: LogHandler
     maxHeadersLen, maxBodyLen, maxMessageLen: int
+    requestTimeoutMs: int
     tcpNoDelay: bool
     rand: Rand
     workerThreads: seq[Thread[Server]]
@@ -135,6 +136,7 @@ type
       upgradedToWebSocket, closeFrameSent: bool
       sendsWaitingForUpgrade: seq[OutgoingBuffer]
       requestCounter: int # Incoming request incs, outgoing response decs
+      readAt: int64
 
   IncomingRequestState = object
     headersParsed: bool
@@ -157,7 +159,7 @@ type
   OutgoingBuffer {.acyclic.} = ref object
     clientSocket: SocketHandle
     clientId: uint64
-    closeConnection, isWebSocketUpgrade, isCloseFrame: bool
+    closeConnection, isWebSocketUpgrade, isCloseFrame, isInformational: bool
     buffer1, buffer2: string
     bytesSent: int
 
@@ -396,6 +398,8 @@ proc respond*(
     "Upgrade",
     "websocket"
   )
+  encodedResponse.isInformational = statusCode in 100 ..< 200 and
+    not encodedResponse.isWebSocketUpgrade
 
   if statusCode < 100 or statusCode >= 200:
     # Mark if this request has received a non-informational (1xx) response
@@ -1147,6 +1151,15 @@ proc destroy(server: Server, joinThreads: bool) {.raises: [].} =
     # The process is likely going to be exiting anyway
     discard
 
+proc readMilliseconds(): int64 {.raises: [].} =
+  ## Reads a monotonic clock for incoming HTTP inactivity deadlines.
+  getMonoTime().ticks div 1_000_000
+
+proc awaitingRequest(dataEntry: DataEntry): bool {.raises: [].} =
+  ## Leaves handlers, outgoing responses, and WebSockets outside read deadlines.
+  not dataEntry.upgradedToWebSocket and dataEntry.requestCounter == 0 and
+    dataEntry.outgoingBuffers.len == 0
+
 proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
   var
     readyKeys: array[maxEventsPerSelectLoop, ReadyKey]
@@ -1161,7 +1174,17 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
     encodedResponses.setLen(0)
     encodedFrames.setLen(0)
 
-    let readyCount = server.selector.selectInto(-1, readyKeys)
+    var wait = -1
+    if server.requestTimeoutMs > 0:
+      let now = readMilliseconds()
+      for clientSocket in server.clientSockets:
+        let dataEntry = server.selector.getData(clientSocket)
+        if dataEntry.awaitingRequest():
+          let remaining = max(0'i64,
+            dataEntry.readAt + server.requestTimeoutMs.int64 - now).int
+          if wait < 0 or remaining < wait:
+            wait = remaining
+    let readyCount = server.selector.selectInto(wait, readyKeys)
 
     # Collapse these events into simple flags
     var responseQueuedTriggered, sendQueuedTriggered, shutdownTriggered: bool
@@ -1197,8 +1220,9 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
               {Read, Write}
             )
 
-            clientDataEntry.requestCounter =
-              max(clientDataEntry.requestCounter - 1, 0)
+            if not encodedResponse.isInformational:
+              clientDataEntry.requestCounter =
+                max(clientDataEntry.requestCounter - 1, 0)
 
             if encodedResponse.isWebSocketUpgrade:
               clientDataEntry.upgradedToWebSocket = true
@@ -1312,6 +1336,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
           dataEntry.clientId = server.rand.next()
           dataEntry.remoteAddress = remoteAddress
           dataEntry.recvBuf.setLen(initialRecvBufLen)
+          if server.requestTimeoutMs > 0:
+            dataEntry.readAt = readMilliseconds()
           server.selector.registerHandle2(clientSocket, {Read}, dataEntry)
       else: # Client socket
         if Error in readyKey.events:
@@ -1331,6 +1357,8 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
             0
           )
           if bytesReceived > 0:
+            if server.requestTimeoutMs > 0:
+              dataEntry.readAt = readMilliseconds()
             dataEntry.bytesReceived += bytesReceived
             receivedFrom.add(readyKey.fd.SocketHandle)
           else:
@@ -1379,6 +1407,16 @@ proc loopForever(server: Server) {.raises: [OSError, IOSelectorsException].} =
         needsClosing = server.afterSend(clientSocket, dataEntry)
       if needsClosing:
         needClosing.incl(clientSocket)
+      elif server.requestTimeoutMs > 0 and dataEntry.awaitingRequest():
+        dataEntry.readAt = readMilliseconds()
+
+    if server.requestTimeoutMs > 0:
+      let now = readMilliseconds()
+      for clientSocket in server.clientSockets:
+        let dataEntry = server.selector.getData(clientSocket)
+        if dataEntry.awaitingRequest() and
+          now - dataEntry.readAt >= server.requestTimeoutMs.int64:
+            needClosing.incl(clientSocket)
 
     for clientSocket in needClosing:
       let dataEntry = server.selector.getData(clientSocket)
@@ -1477,7 +1515,8 @@ proc newServer*(
   maxHeadersLen = 8 * 1024, # 8 KB
   maxBodyLen = 1024 * 1024, # 1 MB
   maxMessageLen = 64 * 1024, # 64 KB
-  tcpNoDelay = true
+  tcpNoDelay = true,
+  requestTimeoutMs = 0
 ): Server {.raises: [MummyError].} =
   ## Creates a new HTTP server. The request handler will be called for incoming
   ## HTTP requests. The WebSocket handler will be called for WebSocket events.
@@ -1488,6 +1527,9 @@ proc newServer*(
 
   if handler == nil:
     raise newException(MummyError, "The request handler must not be nil")
+  if requestTimeoutMs < 0 or requestTimeoutMs > int32.high.int:
+    raise newException(MummyError,
+      "The request timeout must be between 0 and 2147483647 milliseconds")
 
   var workerThreads = workerThreads
   when defined(mummyNoWorkers): # For testing, fuzzing etc
@@ -1500,6 +1542,7 @@ proc newServer*(
   result.maxHeadersLen = maxHeadersLen
   result.maxBodyLen = maxBodyLen
   result.maxMessageLen = maxMessageLen
+  result.requestTimeoutMs = requestTimeoutMs
   result.tcpNoDelay = tcpNoDelay
   result.rand = initRand()
 
